@@ -46,7 +46,6 @@ This script maps this as follows:
 ]]
 
 local json = require 'cjson' -- apt-get install lua-cjson
-local olmstatus, olm = pcall(require, 'olm') -- LuaJIT olm FFI binding ln -s ~/olm/olm.lua /usr/local/share/lua/5.1
 local w = weechat
 
 local SCRIPT_NAME = "matrix"
@@ -64,7 +63,6 @@ local OUT = {}
 local BUFFER
 local Room
 local MatrixServer
-local Olm
 local DEBUG = false
 -- How many seconds to timeout if nothing happened on the server. If something
 -- happens before it will return sooner.
@@ -84,8 +82,6 @@ local errprefix
 local errprefix_c
 
 local HOMEDIR
-local OLM_ALGORITHM = 'm.olm.v1.curve25519-aes-sha2'
-local OLM_KEY = 'secr3t' -- TODO configurable using weechat sec data
 local v2_api_ns = '_matrix/client/v2_alpha'
 
 local function tprint(tbl, indent, out)
@@ -190,35 +186,6 @@ local function get_next_transaction_id()
     return transaction_id_counter
 end
 
---[[
--- Function for signing json, unused for now, we hand craft the required
--- signed json in the encryption function. But I think this function will be
--- needed in the future so leaving it here in a commented version
-local function sign_json(json_object, signing_key, signing_name)
-    -- See: https://github.com/matrix-org/matrix-doc/blob/master/specification/31_event_signing.rst
-    -- Maybe use:http://regex.info/code/JSON.lua which sorts keys
-    local signatures = json_object.signatures or {}
-    json_object.signatures = nil
-
-    local unsigned = json_object.unsigned or nil
-    json_object.unsigned = nil
-
-    -- TODO ensure canonical json
-    local signed = signing_key:sign(json.encode(json_object))
-    local signature_base64 = encode_base64(signed.signature)
-
-    local key_id = ("%s:%s"):format(signing_key.agl, signing_key.version)
-    signatures[signing_name] = {[key_id] = signature_base64}
-
-    json_object.signatures = signatures
-    if unsigned then
-        json_object.unsigned = unsigned
-    end
-
-    return json_object
-end
---]]
-
 local function split_args(args)
     local function_name, arg = args:match('^(.-) (.*)$')
     return function_name, arg
@@ -307,14 +274,6 @@ end
 
 function matrix_unload()
     w.print('', 'matrix: Unloading')
-    -- Clear/free olm memory if loaded
-    if olmstatus then
-        w.print('', 'matrix: Saving olm state')
-        SERVER.olm:save()
-        w.print('', 'matrix: Clearing olm state from memory')
-        SERVER.olm.account:clear()
-        --SERVER.olm = nil
-    end
     w.print('', 'matrix: done cleaning up!')
     return w.WEECHAT_RC_OK
 end
@@ -700,28 +659,7 @@ function real_http_cb(extra, command, rc, stdout, stderr)
             for user_id, v in pairs(js.one_time_keys or {}) do
                 for device_id, keys in pairs(v or {}) do
                     for key_id, key in pairs(keys or {}) do
-                        SERVER.olm.otks[user_id..':'..device_id] = {[device_id]=key}
-                        perr(('olm: Recieved OTK for user %s for device id %s'):format(user_id, device_id))
                         count = count + 1
-                        SERVER.olm:create_session(user_id, device_id)
-                    end
-                end
-            end
-        elseif command:find'/keys/query' then
-            for k, v in pairs(js.device_keys or {}) do
-                SERVER.olm.device_keys[k] = v
-
-                -- Claim keys for all only if missing session
-                for device_id, device_data in pairs(v) do
-                    -- First try to create session from saved data
-                    -- if that doesn't success we will download otk
-                    local device_key = device_data.keys['curve25519:'..device_id]
-                    local sessions = SERVER.olm:get_sessions(device_key)
-                    if #sessions == 0 then
-                        perr('olm: Downloading otk for user '..k..', and device_id: '..device_id)
-                        SERVER.olm:claim(k, device_id)
-                    else
-                        perr('olm: Reusing existing session for user '..k)
                     end
                 end
             end
@@ -730,15 +668,8 @@ function real_http_cb(extra, command, rc, stdout, stderr)
             local sensible_number_of_keys = 20
             for algo, count in pairs(js.one_time_key_counts) do
                 key_count = count
-                SERVER.olm.key_count = key_count
-            end
-            if DEBUG then
-                perr('olm: Number of own OTKs uploaded to server: '..key_count)
             end
             -- TODO make endless loop prevention in case of server error
-            if key_count < sensible_number_of_keys then
-                SERVER.olm:upload_keys()
-            end
         elseif command:find'upload' then
             -- We store room_id in extra
             local room_id = extra
@@ -850,255 +781,6 @@ function upload_cb(data, command, rc, stdout, stderr)
     return w.WEECHAT_RC_OK
 end
 
-Olm = {}
-Olm.__index = Olm
-Olm.create = function()
-    local olmdata = {}
-    setmetatable(olmdata, Olm)
-    if not olmstatus then
-        w.print('', SCRIPT_NAME .. ': Unable to load olm encryption library. Not enabling encryption. Please see documentation (README.md) for information on how to enable.')
-        return
-    end
-
-    local account = olm.Account.new()
-    olmdata.account = account
-    olmdata.sessions = {}
-    olmdata.device_keys = {}
-    olmdata.otks = {}
-    -- Try to read account from filesystem, if not generate a new account
-    local fd = io.open(HOMEDIR..'account.olm', 'rb')
-    local pickled = ''
-    if fd then
-        pickled = fd:read'*all'
-        fd:close()
-    end
-    if pickled == '' then
-        account:create()
-        local _, err = account:generate_one_time_keys(5)
-        perr(err)
-    else
-        local _, err = account:unpickle(OLM_KEY, pickled)
-        perr(err)
-    end
-    local identity = json.decode(account:identity_keys())
-    -- TODO figure out what device id is supposed to be
-    olmdata.device_id = identity.ed25519:match'%w*' -- problems with nonalfanum
-    olmdata.device_key = identity.curve25519
-    w.print('', 'matrix: Encryption loaded. To send encrypted messages in a room, use command /encrypt on with a room as active current buffer')
-    if DEBUG then
-        dbg{olm={
-            'Loaded identity:',
-            json.decode(account:identity_keys())
-        }}
-    end
-    return olmdata
-end
-
-function Olm:save()
-    -- Save account and every pickled session
-    local pickle, err = self.account:pickle(OLM_KEY)
-    perr(err)
-    local fd = io.open(HOMEDIR..'account.olm', 'wb')
-    fd:write(pickle)
-    fd:close()
-    --for key, pickled in pairs(self.sessions) do
-    --    local user_id, device_id = key:match('(.*):(.+)')
-    --    self.write_session_to_file(pickled, user_id, device_id)
-    --end
-end
-
-function Olm:query(user_ids) -- Query keys from other user_id
-    if DEBUG then
-        perr('olm: querying user_ids')
-        tprint(user_ids)
-    end
-    local auth = urllib.urlencode{access_token=SERVER.access_token}
-    local data = {
-        device_keys = {}
-    }
-    for _, uid in pairs(user_ids) do
-        data.device_keys[uid] = {false}
-    end
-    http('/keys/query/?'..auth,
-        {postfields=json.encode(data)},
-        'http_cb',
-        timeout, nil,
-        v2_api_ns
-    )
-end
-
-function Olm:check_server_keycount()
-    local data = urllib.urlencode{access_token=SERVER.access_token}
-    http('/keys/upload/'..self.device_id..'?'..data,
-        {},
-        'http_cb', timeout, nil, v2_api_ns
-    )
-end
-
-function Olm:upload_keys()
-    if DEBUG then
-        perr('olm: Uploading keys')
-    end
-    local id_keys = json.decode(self.account:identity_keys())
-    local user_id = SERVER.user_id
-    local one_time_keys = {}
-    local otks = json.decode(self.account:one_time_keys())
-    local keyCount = 0
-    for id, k in pairs(otks.curve25519) do
-        keyCount = keyCount + 1
-    end
-    perr('olm: keycount: '..tostring(keyCount))
-    if keyCount < 5 then -- try to always have 5 keys
-        perr('olm: newly generated keys: '..tostring(tonumber(
-        self.account:generate_one_time_keys(5 - keyCount))))
-        otks = json.decode(self.account:one_time_keys())
-    end
-
-    for id, key in pairs(otks.curve25519) do
-        one_time_keys['curve25519:'..id] = key
-        keyCount = keyCount + 1
-    end
-
-    -- Construct JSON manually so it's ready for signing
-    local keys_json = '{"algorithms":["' .. OLM_ALGORITHM .. '"]'
-    .. ',"device_id":"' .. self.device_id .. '"'
-    .. ',"keys":'
-    .. '{"ed25519:' .. self.device_id .. '":"'
-    .. id_keys.ed25519
-    .. '","curve25519:' .. self.device_id .. '":"'
-    .. id_keys.curve25519
-    .. '"}'
-    .. ',"user_id":"' .. user_id
-    .. '"}'
-
-    local success, key_data = pcall(json.decode, keys_json)
-    -- TODO save key data to device_keys so we don't have to download
-    -- our own keys from the servers?
-    if not success then
-        perr(('olm: upload_keys: %s when converting to json: %s')
-        :format(key_data, keys_json))
-    end
-
-    local msg = {
-        device_keys = key_data,
-        one_time_keys = one_time_keys
-    }
-    msg.device_keys.signatures = {
-        [user_id] = {
-            ["ed25519:"..self.device_id] = self.account:sign(keys_json)
-        }
-    }
-    local data = urllib.urlencode{
-        access_token = SERVER.access_token
-    }
-    http('/keys/upload/'..self.device_id..'?'..data, {
-        postfields = json.encode(msg)
-    }, 'http_cb', timeout, nil, v2_api_ns)
-
-    self.account:mark_keys_as_published()
-
-end
-
-function Olm:claim(user_id, device_id) -- Fetch one time keys
-    if DEBUG then
-        perr(('olm: Claiming OTK for user: %s and device: %s'):format(user_id, device_id))
-    end
-    -- TODO take a list of ids for batch downloading
-    local auth = urllib.urlencode{ access_token = SERVER.access_token }
-    local data = {
-        one_time_keys = {
-            [user_id] = {
-                [device_id] = 'curve25519'
-            }
-        }
-    }
-    http('/keys/claim?'..auth,
-        {postfields=json.encode(data)},
-        'http_cb', timeout, nil, v2_api_ns
-    )
-end
-
-function Olm:create_session(user_id, device_id)
-    perr(('olm: creating session for user: %s, and device: %s'):format(user_id, device_id))
-    local device_data = self.device_keys[user_id][device_id]
-    if not device_data then
-        perr(('olm: missing device data for user: %s, and device: %s'):format(user_id, device_id))
-        return
-    end
-    local device_key = device_data.keys['curve25519:'..device_id]
-    if not device_key then
-        perr("olm: Missing key for user: "..user_id.." and device: "..device_id.."")
-        return
-    end
-    local sessions = self:get_sessions(device_key)
-    if not sessions[device_key] then
-        perr(('olm: creating NEW session for: %s, and device: %s'):format(user_id, device_id))
-        local session = olm.Session.new()
-        local otk = self.otks[user_id..':'..device_id]
-        if not otk then
-            perr("olm: Missing OTK for user: "..user_id.." and device: "..device_id.."")
-        else
-            otk = otk[device_id]
-        end
-        if otk then
-            session:create_outbound(self.account, device_key, otk)
-            local session_id = session:session_id()
-            perr('olm: Session ID:'..tostring(session_id))
-            self:store_session(device_key, session)
-        end
-        session:clear()
-    end
-end
-
-function Olm:get_sessions(device_key)
-    if DEBUG then
-        perr("olm: get_sessions: device: "..device_key.."")
-    end
-    local sessions = self.sessions[device_key]
-    if not sessions then
-        sessions = self:read_session(device_key)
-    end
-    return sessions
-end
-
-function Olm:read_session(device_key)
-    local session_filename = HOMEDIR..device_key..'.session.olm'
-    local fd, err = io.open(session_filename, 'rb')
-    if fd then
-        perr(('olm: reading saved session device: %s'):format(device_key))
-        local sessions = fd:read'*all'
-        sessions = json.decode(sessions)
-        self.sessions[device_key] = sessions
-        fd:close()
-        return sessions
-    else
-        perr(('olm: Error: %s, reading saved session device: %s'):format(err, device_key))
-    end
-    return {}
-end
-
-function Olm:store_session(device_key, session)
-    local session_id = session:session_id()
-    if DEBUG then
-        perr("olm: store_session: device: "..device_key..", Session ID: "..session_id)
-    end
-    local sessions = self.sessions[device_key] or {}
-    local pickled = session:pickle(OLM_KEY)
-    sessions[session_id] = pickled
-    self.sessions[device_key] = sessions
-    self:write_session_to_file(sessions, device_key)
-end
-
-function Olm:write_session_to_file(sessions, device_key)
-    local session_filename = HOMEDIR..device_key..'.session.olm'
-    local fd, err = io.open(session_filename, 'wb')
-    if fd then
-        fd:write(json.encode(sessions))
-        fd:close()
-    else
-        perr('olm: error saving session: '..tostring(err))
-    end
-end
 
 MatrixServer = {}
 MatrixServer.__index = MatrixServer
@@ -1122,12 +804,6 @@ MatrixServer.create = function()
      -- Use a lock to prevent multiple simul poll with same end token, which
      -- could lead to duplicate messages
      server.poll_lock = false
-     server.olm = Olm.create()
-     if server.olm then -- might not be available
-         -- Run save so we do not lose state. Create might create new account,
-         -- new keys, etc.
-         server.olm:save()
-     end
      return server
 end
 
@@ -1220,13 +896,6 @@ function MatrixServer:post_initial_sync()
     -- Timer used in cased of errors to restart the polling cycle
     -- During normal operation the polling should re-invoke itself
     SERVER.polltimer = w.hook_timer(POLL_INTERVAL*1000, 0, 0, "polltimer_cb", "")
-    if olmstatus then
-        -- timer that checks number of otks available on the server
-        SERVER.otktimer = w.hook_timer(5*60*1000, 0, 0, "otktimer_cb", "")
-        SERVER.olm:query{SERVER.user_id}
-        --SERVER.olm.upload_keys()
-        SERVER.olm:check_server_keycount()
-    end
 end
 
 function MatrixServer:getMessages(room_id, dir, from, limit)
@@ -1476,73 +1145,6 @@ function send(cbdata, calls)
 
         local api_event_function = 'm.room.message'
 
-        if olmstatus and room.encrypted then
-            api_event_function = 'm.room.encrypted'
-            local olmd = SERVER.olm
-
-            data.postfields.algorithm = OLM_ALGORITHM
-            data.postfields.sender_key = olmd.device_key
-            data.postfields.ciphertext = {}
-
-            -- Count number of devices we are sending to
-            local recipient_count = 0
-
-            for user_id, _ in pairs(room.users) do
-                for device_id, device_data in pairs(olmd.device_keys[user_id] or {}) do -- FIXME check for missing keys?
-
-                    local device_key
-                    -- TODO save this better somehow?
-                    for key_id, key_data in pairs(device_data.keys) do
-                        if key_id:match('^curve25519') then
-                            device_key = key_data
-                        end
-                    end
-                    local sessions = olmd:get_sessions(device_key)
-                    -- Use the session with the lowest ID
-                    -- TODO: figure out how to pick session better?
-                    table.sort(sessions)
-                    local pickled = next(sessions)
-                    if pickled then
-                        local session = olm.Session.new()
-                        session:unpickle(OLM_KEY, pickled)
-                        local session_id = session:session_id()
-                        perr(('Session ID: %s, user_id: %s, device_id: %s'):
-                            format(session_id, user_id, device_id))
-                        local payload = {
-                            room_id = room.identifier,
-                            ['type'] = "m.room.message",
-                            fingerprint = "", -- TODO: Olm:sha256 participants
-                            sender_device = olmd.device_id,
-                            content = {
-                                msgtype = msgtype,
-                                body = data.postfields.body or '',
-                                url = url
-                            }
-                        }
-                        -- encrypt body
-                        local mtype, e_body = session:encrypt(json.encode(payload))
-                        local ciphertext = {
-                            ["type"] = mtype,
-                            body = e_body
-                        }
-                        data.postfields.ciphertext[device_key] = ciphertext
-                        recipient_count = recipient_count + 1
-
-                        -- Save session
-                        olmd:store_session(device_key, session)
-                        session:clear()
-                    end
-                end
-            end
-            -- remove cleartext from original msg
-            data.postfields.body = nil
-            data.postfields.formatted_body = nil
-
-            if recipient_count == 0 then
-                perr('Aborted sending of encrypted message: could not find any valid recipients')
-                return
-            end
-        end
 
         data.postfields = json.encode(data.postfields)
         data.customrequest = 'PUT'
@@ -2243,109 +1845,6 @@ function Room:formatNick(user_id)
     return nick_f
 end
 
-function Room:decryptChunk(chunk)
-    -- vector client doesn't provide this
-    chunk.content.msgtype = 'm.text'
-
-    if not olmstatus then
-        chunk.content.body = 'encrypted message, unable to decrypt'
-        return chunk
-    end
-
-    chunk.content.body = 'encrypted message, unable to decrypt'
-    local device_key = chunk.content.sender_key
-    -- Find our id
-    local ciphertexts = chunk.content.ciphertext
-    local ciphertext
-    if not ciphertexts then
-        chunk.content.body = 'Recieved an encrypted message, but could not find ciphertext array'
-    else
-        ciphertext = ciphertexts[SERVER.olm.device_key]
-    end
-    if not ciphertext then
-        chunk.content.body = 'Recieved an encrypted message, but could not find cipher for ourselves from the sender.'
-        return chunk
-    end
-
-    local session
-    local decrypted
-    local err
-    local found_session = false
-    local sessions = SERVER.olm:get_sessions(device_key)
-    for id, pickle in pairs(sessions) do
-        -- Check if we already successfully decrypted with a sesssion, if that
-        -- is the case we break the loop
-        if decrypted then
-            break
-        end
-        session = olm.Session.new()
-        session:unpickle(OLM_KEY, pickle)
-        local matches_inbound = session:matches_inbound(ciphertext.body)
-        ---if ciphertext.type == 0 and matches_inbound then
-        if matches_inbound then
-            found_session = true
-        end
-        local cleartext
-        cleartext, err = session:decrypt(ciphertext.type, ciphertext.body)
-        if not err then
-            if DEBUG then
-                perr(('olm: Able to decrypt with an existing session %s'):format(session:session_id()))
-            end
-            decrypted = cleartext
-            SERVER.olm:store_session(device_key, session)
-        else
-            chunk.content.body = "Decryption error: "..err
-            if DEBUG then
-                perr(('olm: Unable to decrypt with an existing session: %s. Session-ID: %s'):format(err, session:session_id()))
-            end
-        end
-        session:clear()
-    end
-    if ciphertext.type == 0 and not found_session and not decrypted then
-        session = olm.Session.new()
-        local _
-        _, err = session:create_inbound_from(
-            SERVER.olm.account, device_key, ciphertext.body)
-        if err then
-            session:clear()
-            chunk.content.body = "Decryption error: create inbound "..err
-            return chunk
-        end
-        decrypted, err = session:decrypt(ciphertext.type, ciphertext.body)
-        if err then
-            session:clear()
-            chunk.content.body = "Decryption error: "..err
-            return chunk
-        end
-        -- TODO SERVER.olm.account:remove_one_time_keys(session)
-        local session_id = session:session_id()
-        perr(('Session ID: %s, user_id: %s, device_id: %s'):
-        format(session_id, SERVER.user_id, SERVER.olm.device_id))
-        SERVER.olm:store_session(device_key, session)
-        session:clear()
-        if err then
-            chunk.content.body = "Decryption error: "..err
-            return chunk
-        end
-    end
-
-    if decrypted then
-        local success, payload = pcall(json.decode, decrypted)
-        if not success then
-            chunk.content.body = "Payload error: "..payload
-            return chunk
-        end
-        -- TODO use the room id from payload for security
-        chunk.content.msgtype = payload.content.msgtype
-        -- Style the message so user can tell if it's
-        -- an encrypted message or not
-        local color = w.color(w.config_get_plugin(
-            'encrypted_message_color'))
-        chunk.content.body = color .. payload.content.body
-    end
-
-    return chunk
-end
 
 -- Parses a chunk of json meant for a room
 function Room:ParseChunk(chunk, backlog, chunktype)
@@ -2397,7 +1896,6 @@ function Room:ParseChunk(chunk, backlog, chunktype)
     if chunk['type'] == 'm.room.message' or chunk['type'] == 'm.room.encrypted' then
         if chunk['type'] == 'm.room.encrypted'  then
             tag{'no_log'} -- Don't log encrypted message
-            chunk = self:decryptChunk(chunk)
             was_decrypted = true
         end
 
@@ -2593,9 +2091,6 @@ function Room:ParseChunk(chunk, backlog, chunktype)
                 )
                 w.print_date_tags(self.buffer, time_int, tags(), data)
                 -- if this is an encrypted room, also download key
-                if olmstatus and self.encrypted then
-                    SERVER.olm:query{sender}
-                end
             end
         elseif chunk['content']['membership'] == 'leave' then
             if chunktype == 'messages' then
@@ -2870,7 +2365,6 @@ end
 function Room:Download_keys()
     for id, name in pairs(self.users) do
         -- TODO enable batch downloading of keys here when synapse can handle it
-        SERVER.olm:query({id})
     end
 end
 
@@ -2912,7 +2406,6 @@ function polltimer_cb(a, b)
 end
 
 function otktimer_cb(a, b)
-    SERVER.olm:check_server_keycount()
     return w.WEECHAT_RC_OK
 end
 
@@ -3384,7 +2877,6 @@ if w.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE, SCRIPT
         local_echo = {'on', 'Print lines locally instead of waiting for return from server'},
         debug = {'off', 'Print a lot of extra information to help with finding bugs and other problems.'},
         encrypted_message_color = {'lightgreen', 'Print encrypted mesages with this color'},
-        --olm_secret = {'', 'Password used to secure olm stores'},
         timeout = {'5', 'Time in seconds until a connection is assumed to be timed out'},
         nick_style = {'nick', 'Show nicknames or user IDs in chat (\'nick\' or \'uid\')'},
         read_receipts = {'on', 'Send read receipts. Note that not sending them will prevent a room to be marked as read in Riot clients.'}
